@@ -6,6 +6,22 @@ const path = require('path');
 const config = require('./config');
 const Utils = require('./utils');
 
+// 白名单：只抓取以下集合URL
+const WHITELIST_COLLECTION_URLS = [
+  'https://consciousitems.com/collections/anklets',
+  'https://consciousitems.com/collections/bracelet',
+  'https://consciousitems.com/collections/demi-fine-silver-jewelry',
+  'https://consciousitems.com/collections/earrings',
+  'https://consciousitems.com/collections/healing-necklace',
+  'https://consciousitems.com/collections/rings',
+  'https://consciousitems.com/collections/carvings-pyramids',
+  'https://consciousitems.com/collections/crystals',
+  'https://consciousitems.com/collections/crystals-for-car-protection',
+  'https://consciousitems.com/collections/carvings-pyramids',
+  'https://consciousitems.com/collections/healing-crystal-lamps',
+  'https://consciousitems.com/collections/crystal-cleansing',
+];
+
 class CollectionScraper {
   constructor() {
     this.data = {
@@ -15,6 +31,70 @@ class CollectionScraper {
     };
     this.browser = null;
     this.context = null;
+  }
+
+  // 直接根据白名单URL抓取集合
+  async scrapeCollectionsFromWhitelist(collectionUrls) {
+    console.log('开始从白名单抓取集合数据...');
+    const page = await this.context.newPage();
+
+    for (let i = 0; i < collectionUrls.length; i++) {
+      const collectionUrl = (collectionUrls[i] || '').trim();
+      if (!collectionUrl) continue;
+
+      // 从URL推断语言，否则使用默认语言
+      const language = Utils.extractLanguageFromUrl(collectionUrl) || config.languages.default;
+
+      console.log(`\n处理白名单集合 ${i + 1}/${collectionUrls.length}: ${collectionUrl} (语言: ${language})`);
+
+      try {
+        const collectionData = await Utils.retry(async () => {
+          await page.goto(collectionUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000
+          });
+
+          await page.waitForTimeout(2000);
+
+          const data = await Utils.extractPageData(page, config.selectors.collection);
+          const productUrls = await this.extractProductUrlsFromCollection(page, collectionUrl);
+
+          return {
+            ...data,
+            language,
+            lastmod: null,
+            originalUrl: collectionUrl,
+            productUrls: productUrls,
+            productCount: productUrls.length
+          };
+        }, config.scraping.maxRetries);
+
+        this.data.collections.push(collectionData);
+        this.data.totalProducts += collectionData.productUrls.length;
+
+        console.log(`✓ 已抓取集合: ${collectionData.title || '未知标题'}`);
+        console.log(`  产品数量: ${collectionData.productUrls.length} 个`);
+
+        await this.saveCollectionData(collectionData);
+
+        if (collectionData.productUrls.length > 0) {
+          console.log('  产品URL示例:');
+          collectionData.productUrls.slice(0, 10).forEach((url, index) => {
+            console.log(`    ${index + 1}. ${url}`);
+          });
+          if (collectionData.productUrls.length > 10) {
+            console.log(`    ... 还有 ${collectionData.productUrls.length - 10} 个产品`);
+          }
+        }
+
+        // 添加延迟避免被检测
+        await Utils.delay(5000);
+      } catch (error) {
+        console.error(`✗ 抓取白名单集合失败 ${collectionUrl}:`, error.message);
+      }
+    }
+
+    await page.close();
   }
 
   // 初始化浏览器
@@ -700,15 +780,8 @@ class CollectionScraper {
       // 1. 初始化浏览器
       await this.initBrowser();
       
-      // 2. 获取主sitemap
-      const sitemaps = await this.getMainSitemap();
-      
-      // 3. 过滤集合sitemap
-      const collectionSitemaps = this.filterCollectionSitemaps(sitemaps);
-      console.log(`找到 ${collectionSitemaps.length} 个集合sitemap`);
-      
-      // 4. 抓取集合数据
-      await this.scrapeCollections(collectionSitemaps);
+      // 2. 使用白名单URL抓取集合数据（不再从sitemap读取）
+      await this.scrapeCollectionsFromWhitelist(WHITELIST_COLLECTION_URLS);
       
       // 5. 分析语言
       this.analyzeLanguages();
