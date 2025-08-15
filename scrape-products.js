@@ -110,8 +110,15 @@ class ProductScraper {
         const sitemapData = await this.parseSitemapXml(response.data);
         
         if (sitemapData.urlset && sitemapData.urlset.url) {
-          const products = sitemapData.urlset.url;
-          console.log(`找到 ${products.length} 个产品URL`);
+          const allUrls = sitemapData.urlset.url;
+          
+          // 过滤出真正的产品URL
+          const products = allUrls.filter(item => {
+            const url = item.loc[0];
+            return url.includes('/products/') && url !== 'https://consciousitems.com/';
+          });
+          
+          console.log(`找到 ${allUrls.length} 个URL，其中 ${products.length} 个是产品URL`);
           
           for (let i = 0; i < products.length; i++) {
             const product = products[i];
@@ -138,12 +145,16 @@ class ProductScraper {
                   console.error(`❌ 保存产品失败: ${productData.title}`, error.message);
                 }
                 
-                // 添加延迟避免被检测
-                await Utils.delay(config.scraping.delayBetweenRequests);
+                // 添加随机延迟避免被检测 (2-5秒)
+                const randomDelay = Math.floor(Math.random() * 3000) + 2000; // 2000-5000ms
+                console.log(`等待 ${randomDelay}ms 后继续下一个产品...`);
+                await Utils.delay(randomDelay);
               }
               
             } catch (error) {
-              console.error(`抓取产品失败 ${productUrl}:`, error.message);
+              console.error(`❌ 抓取产品失败 ${productUrl}:`, error.message);
+              // 记录失败的URL到日志
+              console.error(`失败的产品URL: ${productUrl}`);
             }
           }
         }
@@ -197,6 +208,9 @@ class ProductScraper {
       // 等待页面基本元素加载
       await page.waitForSelector('h1, .product__title, .product-title', { timeout: 30000 });
       
+      // 额外等待页面完全加载
+      await page.waitForTimeout(2000);
+      
       // 提取产品信息
       const productData = {
         id: this.generateSlug(productUrl), // 添加产品ID
@@ -216,7 +230,7 @@ class ProductScraper {
         category: '',
         rating: null,
         reviewCount: 0,
-        availability: '',
+        availability: null,
         scrapedAt: new Date().toISOString()
       };
 
@@ -242,6 +256,29 @@ class ProductScraper {
       // 提取变体信息
       productData.variants = await this.extractVariants(page);
       
+      // 如果有变体，更新价格逻辑
+      if (productData.variants && productData.variants.length > 0) {
+        console.log(`产品有 ${productData.variants.length} 个变体`);
+        
+        // 找到第一个可用的变体
+        const firstAvailableVariant = productData.variants.find(variant => variant.available);
+        
+        if (firstAvailableVariant) {
+          // 使用第一个可用变体的价格
+          const variantPrice = firstAvailableVariant.price / 100; // 转换为美元
+          productData.price = `$${variantPrice.toFixed(2)}`;
+          console.log(`使用变体价格: ${productData.price} (变体: ${firstAvailableVariant.value})`);
+        } else {
+          // 如果没有可用的变体，使用第一个变体的价格
+          const firstVariant = productData.variants[0];
+          const variantPrice = firstVariant.price / 100; // 转换为美元
+          productData.price = `$${variantPrice.toFixed(2)}`;
+          console.log(`使用第一个变体价格: ${productData.price} (变体: ${firstVariant.value})`);
+        }
+      } else {
+        console.log('产品没有变体，使用原始价格');
+      }
+      
       // 提取图片
       productData.images = await this.extractImages(page, sitemapImages);
       
@@ -256,14 +293,24 @@ class ProductScraper {
       productData.rating = ratingInfo.rating;
       productData.reviewCount = ratingInfo.reviewCount;
       
-      // 提取库存状态
-      productData.availability = await this.extractAvailability(page);
+      // 根据变体情况确定库存状态
+      if (productData.variants && productData.variants.length > 0) {
+        // 如果有变体，检查是否有任何变体可用
+        const hasAvailableVariant = productData.variants.some(variant => variant.available);
+        productData.availability = hasAvailableVariant;
+        console.log(`基于变体判断库存状态: ${productData.availability} (${productData.variants.filter(v => v.available).length}/${productData.variants.length} 个变体可用)`);
+      } else {
+        // 如果没有变体，使用页面检测的库存状态
+        productData.availability = await this.extractAvailability(page);
+        console.log(`基于页面检测库存状态: ${productData.availability}`);
+      }
       
       console.log(`成功抓取产品: ${productData.title}`);
       return productData;
       
     } catch (error) {
-      console.error(`抓取产品详情失败: ${error.message}`);
+      console.error(`❌ 抓取产品详情失败: ${error.message}`);
+      console.error(`失败的URL: ${productUrl}`);
       return null;
     }
   }
@@ -460,34 +507,7 @@ class ProductScraper {
     try {
       const variants = [];
       
-      // 查找变体选择器
-      const variantSelectors = [
-        'variant-radios input[type="radio"]',
-        '.variant-input-wrapper input',
-        '[data-option-value]'
-      ];
-      
-      for (const selector of variantSelectors) {
-        const elements = await page.$$(selector);
-        if (elements.length > 0) {
-          for (const element of elements) {
-            const value = await element.getAttribute('value');
-            const id = await element.getAttribute('id');
-            
-            if (value) {
-              variants.push({
-                id: id || '',
-                value: value,
-                price: 0, // 初始化为数字0
-                available: await element.getAttribute('disabled') !== 'disabled'
-              });
-            }
-          }
-          break;
-        }
-      }
-      
-      // 尝试从JSON数据中提取价格信息
+      // 首先尝试从JSON数据中提取完整的变体信息
       try {
         const jsonScripts = await page.$$('script[type="application/json"]');
         for (const script of jsonScripts) {
@@ -495,14 +515,24 @@ class ProductScraper {
           if (jsonText) {
             try {
               const jsonData = JSON.parse(jsonText);
-              if (Array.isArray(jsonData)) {
-                // 匹配变体数据
-                for (let i = 0; i < Math.min(variants.length, jsonData.length); i++) {
-                  const variant = jsonData[i];
-                  if (variant.price && typeof variant.price === 'number') {
-                    // 直接使用数字价格（以分为单位）
-                    variants[i].price = variant.price;
+              if (Array.isArray(jsonData) && jsonData.length > 0) {
+                // 检查是否是变体数据（包含id, title, price等字段）
+                const firstItem = jsonData[0];
+                if (firstItem.id && firstItem.title && typeof firstItem.price === 'number') {
+                  console.log(`从JSON数据中提取到 ${jsonData.length} 个变体`);
+                  
+                  for (const variant of jsonData) {
+                    variants.push({
+                      id: variant.id?.toString() || '',
+                      value: variant.title || variant.option1 || '',
+                      price: variant.price || 0,
+                      available: variant.available || false,
+                      sku: variant.sku || '',
+                      inventory_quantity: variant.inventory_quantity || 0
+                    });
                   }
+                  
+                  return variants;
                 }
               }
             } catch (parseError) {
@@ -512,7 +542,69 @@ class ProductScraper {
           }
         }
       } catch (error) {
-        console.error('提取变体价格失败:', error.message);
+        console.error('从JSON提取变体数据失败:', error.message);
+      }
+      
+      // 备用方案：从HTML元素中提取变体信息
+      const variantSelectors = [
+        'variant-radios input[type="radio"]',
+        '.variant-input-wrapper input',
+        '[data-option-value]'
+      ];
+      
+      for (const selector of variantSelectors) {
+        const elements = await page.$$(selector);
+        if (elements.length > 0) {
+          console.log(`从HTML元素中提取到 ${elements.length} 个变体`);
+          
+          for (const element of elements) {
+            const value = await element.getAttribute('value');
+            const id = await element.getAttribute('id');
+            const disabled = await element.getAttribute('disabled');
+            
+            if (value) {
+              variants.push({
+                id: id || '',
+                value: value,
+                price: 0, // 初始化为数字0
+                available: disabled !== 'disabled'
+              });
+            }
+          }
+          break;
+        }
+      }
+      
+      // 如果从HTML提取了变体，尝试从JSON中补充价格信息
+      if (variants.length > 0) {
+        try {
+          const jsonScripts = await page.$$('script[type="application/json"]');
+          for (const script of jsonScripts) {
+            const jsonText = await script.textContent();
+            if (jsonText) {
+              try {
+                const jsonData = JSON.parse(jsonText);
+                if (Array.isArray(jsonData)) {
+                  // 匹配变体数据
+                  for (let i = 0; i < Math.min(variants.length, jsonData.length); i++) {
+                    const variant = jsonData[i];
+                    if (variant.price && typeof variant.price === 'number') {
+                      variants[i].price = variant.price;
+                    }
+                    if (typeof variant.available === 'boolean') {
+                      variants[i].available = variant.available;
+                    }
+                  }
+                }
+              } catch (parseError) {
+                // 忽略JSON解析错误，继续处理其他脚本
+                continue;
+              }
+            }
+          }
+        } catch (error) {
+          console.error('补充变体价格信息失败:', error.message);
+        }
       }
       
       return variants;
@@ -746,11 +838,82 @@ class ProductScraper {
   // 提取库存状态
   async extractAvailability(page) {
     try {
+      // 方法1: 检查是否有"Notify Me When Available"按钮 - 表示无库存
+      const notifyButtonSelectors = [
+        '.klaviyo-bis-trigger',
+        'a[href="#"].klaviyo-bis-trigger',
+        'a.klaviyo-bis-trigger',
+        '.product-form__submit[disabled]',
+        'button[disabled]'
+      ];
+      
+      for (const selector of notifyButtonSelectors) {
+        const element = await page.$(selector);
+        if (element) {
+          const text = await element.textContent();
+          if (text && (text.includes('Notify') || text.includes('notify'))) {
+            console.log(`检测到无库存状态: 找到通知按钮 "${text.trim()}"`);
+            return false;
+          }
+        }
+      }
+      
+      // 方法2: 检查按钮是否被禁用且显示"Notify me"
+      const disabledNotifyButton = await page.$('button[disabled][style*="display: none"]');
+      if (disabledNotifyButton) {
+        const text = await disabledNotifyButton.textContent();
+        if (text && text.includes('Notify')) {
+          console.log(`检测到无库存状态: 找到禁用的通知按钮 "${text.trim()}"`);
+          return false;
+        }
+      }
+      
+      // 方法3: 检查整个产品表单区域
+      const productForm = await page.$('.product-form__buttons');
+      if (productForm) {
+        const formHtml = await productForm.innerHTML();
+        if (formHtml.includes('klaviyo-bis-trigger') && formHtml.includes('Notify')) {
+          console.log('检测到无库存状态: 在产品表单中找到通知按钮');
+          return false;
+        }
+      }
+      
+      // 方法4: 检查是否有"Add to Cart"按钮 - 表示有库存
+      const addToCartSelectors = [
+        'button[name="add"]:not([disabled])',
+        '.product-form__submit:not([disabled])',
+        'button[type="submit"]:not([disabled])',
+        '.add-to-cart:not([disabled])'
+      ];
+      
+      for (const selector of addToCartSelectors) {
+        const element = await page.$(selector);
+        if (element) {
+          const text = await element.textContent();
+          if (text && (text.includes('Add') || text.includes('add'))) {
+            console.log(`检测到有库存状态: 找到添加购物车按钮 "${text.trim()}"`);
+            return true;
+          }
+        }
+      }
+      
+      // 方法5: 检查是否有可用的提交按钮
+      const enabledSubmitButton = await page.$('button[type="submit"]:not([disabled])');
+      if (enabledSubmitButton) {
+        const text = await enabledSubmitButton.textContent();
+        if (text && text.trim()) {
+          console.log(`检测到有库存状态: 找到可用的提交按钮 "${text.trim()}"`);
+          return true;
+        }
+      }
+      
+      // 方法6: 通用库存状态选择器（备用方案）
       const availabilitySelectors = [
         '.product-availability',
         '[data-availability]',
         '.availability',
-        '.stock-status'
+        '.stock-status',
+        '.inventory-status'
       ];
       
       for (const selector of availabilitySelectors) {
@@ -758,15 +921,24 @@ class ProductScraper {
         if (element) {
           const text = await element.textContent();
           if (text && text.trim()) {
-            return text.trim();
+            const lowerText = text.trim().toLowerCase();
+            if (lowerText.includes('out of stock') || lowerText.includes('unavailable') || lowerText.includes('sold out')) {
+              console.log(`从通用选择器检测到无库存状态: "${text.trim()}"`);
+              return false;
+            } else if (lowerText.includes('in stock') || lowerText.includes('available')) {
+              console.log(`从通用选择器检测到有库存状态: "${text.trim()}"`);
+              return true;
+            }
           }
         }
       }
       
-      return '';
+      // 默认状态：如果无法确定，返回true（有库存）
+      console.log('无法确定库存状态，默认为有库存');
+      return true;
     } catch (error) {
       console.error('提取库存状态失败:', error.message);
-      return '';
+      return null;
     }
   }
 
@@ -863,7 +1035,7 @@ class ProductScraper {
     const sanitized = { ...productData };
     
     // 确保所有字符串字段都是有效的UTF-8字符串
-    const stringFields = ['id', 'title', 'price', 'originalPrice', 'sku', 'category', 'availability'];
+    const stringFields = ['id', 'title', 'price', 'originalPrice', 'sku', 'category'];
     stringFields.forEach(field => {
       if (sanitized[field] && typeof sanitized[field] === 'string') {
         // 移除控制字符和无效字符
@@ -875,6 +1047,27 @@ class ProductScraper {
         sanitized[field] = '';
       }
     });
+    
+    // 确保availability字段是有效的布尔值
+    if (sanitized.availability !== null && sanitized.availability !== undefined) {
+      if (typeof sanitized.availability === 'boolean') {
+        // 已经是布尔值，保持不变
+      } else if (typeof sanitized.availability === 'string') {
+        // 如果是字符串，转换为布尔值
+        const lowerText = sanitized.availability.toLowerCase();
+        if (lowerText.includes('out of stock') || lowerText.includes('unavailable') || lowerText.includes('sold out') || lowerText === 'false') {
+          sanitized.availability = false;
+        } else if (lowerText.includes('in stock') || lowerText.includes('available') || lowerText === 'true') {
+          sanitized.availability = true;
+        } else {
+          sanitized.availability = true; // 默认值
+        }
+      } else {
+        sanitized.availability = true; // 默认值
+      }
+    } else {
+      sanitized.availability = true; // 默认值
+    }
     
     // 保持HTML格式的字段（description, features, dimensions, materials）
     const htmlFields = ['description', 'features', 'dimensions', 'materials'];

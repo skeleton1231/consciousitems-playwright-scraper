@@ -6,14 +6,14 @@ module.exports = {
   // 浏览器配置
   browser: {
     headless: true,
-    slowMo: 100, // 延迟，避免被检测
+    slowMo: 200, // 延迟，避免被检测 - 增加到200ms
     timeout: 30000
   },
   
   // 抓取配置
   scraping: {
     maxConcurrent: 3, // 最大并发数
-    delayBetweenRequests: 1000, // 请求间隔(毫秒)
+    delayBetweenRequests: 3000, // 请求间隔(毫秒) - 增加到3秒
     maxRetries: 3, // 最大重试次数
     timeout: 30000 // 页面加载超时
   },

@@ -14,6 +14,108 @@ if (!supabaseUrl || !supabaseKey) {
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+// ---------------- Collections helpers (aligned with update-collections-optimized.js) ----------------
+// Patterns of collection files we should ignore (price/sale/test buckets etc.)
+const PRICE_FILTER_PATTERNS = [
+  /0-25-urls\.json$/,
+  /25-35-urls\.json$/,
+  /35-50-urls\.json$/,
+  /50-75-urls\.json$/,
+  /70-off-sale-urls\.json$/,
+  /75-off-urls\.json$/,
+  /under-25-urls\.json$/,
+  /under-15-urls\.json$/,
+  /under-35-urls\.json$/,
+  /sale\d+-urls\.json$/,
+  /mom\d+-urls\.json$/,
+  /venta-urls\.json$/,
+  /promotion-urls\.json$/,
+  /promocion-urls\.json$/,
+  /bundle-sale-urls\.json$/,
+  /last-chance-urls\.json$/,
+  /back-soon-urls\.json$/,
+  /back-aug.*-urls\.json$/,
+  /almost-out-of-stock-urls\.json$/,
+  /favorites-under-.*-urls\.json$/,
+  /shop-favorites-under-.*-urls\.json$/,
+  /black-friday-collection-urls\.json$/,
+  /coleccion-del-viernes-negro-urls\.json$/,
+  /regalos-.*-urls\.json$/,
+  /gifts-.*-urls\.json$/,
+  /giveaway-gifts-urls\.json$/,
+  /free-items-urls\.json$/,
+  /regalo-.*-urls\.json$/,
+  /test-urls\.json$/,
+  /prueba-urls\.json$/
+];
+
+function shouldFilterFile(filename) {
+  return PRICE_FILTER_PATTERNS.some((pattern) => pattern.test(filename));
+}
+
+function extractProductSlug(url) {
+  try {
+    const urlObj = new URL(url);
+    const pathParts = urlObj.pathname.split('/');
+    const productsIndex = pathParts.indexOf('products');
+    if (productsIndex !== -1 && productsIndex + 1 < pathParts.length) {
+      return pathParts[productsIndex + 1];
+    }
+    return null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function extractCollectionName(filename) {
+  return filename.replace('-urls.json', '');
+}
+
+// Build a mapping of productSlug -> array of collection names for a given locale
+function buildCollectionsMap(locale) {
+  const collectionsDir = path.join(__dirname, 'data', 'collections', locale);
+  const map = new Map();
+
+  if (!fs.existsSync(collectionsDir)) {
+    return map;
+  }
+
+  const files = fs
+    .readdirSync(collectionsDir)
+    .filter((file) => file.endsWith('-urls.json') && !shouldFilterFile(file));
+
+  for (const file of files) {
+    const filePath = path.join(collectionsDir, file);
+    try {
+      const content = fs.readFileSync(filePath, 'utf8');
+      const data = JSON.parse(content);
+      if (!Array.isArray(data)) continue;
+
+      const collectionName = extractCollectionName(path.basename(filePath));
+
+      for (const item of data) {
+        const slug = extractProductSlug(item.url);
+        if (!slug) continue;
+        const itemLanguage = item.language || locale;
+        if (itemLanguage !== locale) continue;
+
+        if (!map.has(slug)) map.set(slug, new Set());
+        map.get(slug).add(collectionName);
+      }
+    } catch (_) {
+      // Ignore malformed files
+      continue;
+    }
+  }
+
+  // Convert Sets to arrays for easier consumption later
+  const result = new Map();
+  for (const [slug, set] of map.entries()) {
+    result.set(slug, Array.from(set));
+  }
+  return result;
+}
+
 // Helper function to extract price as integer
 function extractPrice(priceString) {
   if (!priceString) return 0;
@@ -26,7 +128,17 @@ function extractPrice(priceString) {
 // Helper function to clean HTML tags from text
 function cleanHtml(text) {
   if (!text) return '';
-  return text.trim();
+  // Remove all HTML tags and decode HTML entities
+  return text
+    .replace(/<[^>]*>/g, '') // Remove all HTML tags
+    .replace(/&nbsp;/g, ' ') // Replace &nbsp; with space
+    .replace(/&amp;/g, '&') // Replace &amp; with &
+    .replace(/&lt;/g, '<') // Replace &lt; with <
+    .replace(/&gt;/g, '>') // Replace &gt; with >
+    .replace(/&quot;/g, '"') // Replace &quot; with "
+    .replace(/&#39;/g, "'") // Replace &#39; with '
+    .replace(/\s+/g, ' ') // Replace multiple spaces with single space
+    .trim();
 }
 
 // Helper function to get first image URL
@@ -35,77 +147,95 @@ function getFirstImageUrl(images) {
   return images[0].url.startsWith('//') ? `https:${images[0].url}` : images[0].url;
 }
 
-// Helper function to determine category from product data
-function determineCategory(product) {
-  // You can customize this logic based on your product categorization needs
-  const title = product.title?.toLowerCase() || '';
-  const description = product.description?.toLowerCase() || '';
-  
-  if (title.includes('anklet') || description.includes('anklet')) return 'Jewelry';
-  if (title.includes('bracelet') || description.includes('bracelet')) return 'Jewelry';
-  if (title.includes('necklace') || description.includes('necklace')) return 'Jewelry';
-  if (title.includes('ring') || description.includes('ring')) return 'Jewelry';
-  if (title.includes('crystal') || description.includes('crystal')) return 'Crystals';
-  if (title.includes('candle') || description.includes('candle')) return 'Home & Living';
-  if (title.includes('incense') || description.includes('incense')) return 'Home & Living';
-  
-  return 'Jewelry'; // Default category
-}
 
-// Helper function to determine sub-category
-function determineSubCategory(product) {
-  const title = product.title?.toLowerCase() || '';
-  const description = product.description?.toLowerCase() || '';
-  
-  if (title.includes('anklet') || description.includes('anklet')) return 'Anklets';
-  if (title.includes('bracelet') || description.includes('bracelet')) return 'Bracelets';
-  if (title.includes('necklace') || description.includes('necklace')) return 'Necklaces';
-  if (title.includes('ring') || description.includes('ring')) return 'Rings';
-  if (title.includes('crystal') || description.includes('crystal')) return 'Crystal Stones';
-  
-  return 'Accessories'; // Default sub-category
-}
 
 // Function to transform product data to database schema
-function transformProductData(product, locale = 'en') {
+function transformProductData(product, locale = 'en', collectionsMap = null) {
   const price = extractPrice(product.price);
+  const slug = product.id;
+  const collections = Array.isArray(collectionsMap?.get(slug))
+    ? collectionsMap.get(slug)
+    : [];
+  
+  // Handle availability field - convert to boolean
+  let availability = false;
+  if (product.availability !== null && product.availability !== undefined) {
+    if (typeof product.availability === 'boolean') {
+      availability = product.availability;
+    } else if (typeof product.availability === 'string') {
+      const lowerText = product.availability.toLowerCase();
+      availability = !(lowerText.includes('out of stock') || lowerText.includes('unavailable') || lowerText.includes('sold out') || lowerText === 'false');
+    }
+  }
   
   return {
-    slug: product.id,
+    slug,
     name: product.title,
     description: cleanHtml(product.description),
-    category: determineCategory(product),
-    sub_category: determineSubCategory(product),
+    category: 'Jewelry', // Default category since it's required
     price: price,
     currency: 'USD',
     image_url: getFirstImageUrl(product.images),
     affiliate_url: product.url,
-    semantic_keywords: product.features ? cleanHtml(product.features) : null,
     locale: locale,
-    features: product.features ? cleanHtml(product.features) : null,
-    dimensions: product.dimensions ? cleanHtml(product.dimensions) : null,
+    features: product.features,
+    dimensions: product.dimensions,
     rating: product.rating ? parseFloat(product.rating) : null,
-    review_count: product.reviewCount || null
+    review_count: product.reviewCount || null,
+    availability: availability,
+    collections: collections,
+    clean_description: cleanHtml(product.description),
+    clean_features: product.features ? cleanHtml(product.features) : null
   };
 }
 
-// Function to insert a single product
+// Function to insert or update a single product
 async function insertProduct(productData) {
   try {
-    const { data, error } = await supabase
+    // First check if product exists
+    const { data: existingProduct, error: fetchError } = await supabase
       .from('all_products')
-      .upsert([productData], { 
-        onConflict: 'slug',
-        ignoreDuplicates: false 
-      })
-      .select();
+      .select('id')
+      .eq('slug', productData.slug)
+      .single();
 
-    if (error) {
-      console.error('Error upserting product:', error);
+    if (fetchError && fetchError.code !== 'PGRST116') {
+      console.error('Error checking existing product:', fetchError);
       return false;
     }
 
-    console.log(`✅ Successfully upserted product: ${productData.name}`);
+    let result;
+    if (existingProduct) {
+      // Update existing product
+      const { data, error } = await supabase
+        .from('all_products')
+        .update(productData)
+        .eq('slug', productData.slug)
+        .select();
+
+      if (error) {
+        console.error('Error updating product:', error);
+        return false;
+      }
+
+      console.log(`✅ Successfully updated product: ${productData.name}`);
+      result = data;
+    } else {
+      // Insert new product
+      const { data, error } = await supabase
+        .from('all_products')
+        .insert([productData])
+        .select();
+
+      if (error) {
+        console.error('Error inserting product:', error);
+        return false;
+      }
+
+      console.log(`✅ Successfully inserted new product: ${productData.name}`);
+      result = data;
+    }
+
     return true;
   } catch (error) {
     console.error('Error upserting product:', error);
@@ -130,6 +260,7 @@ async function processAllProducts(locale = 'en') {
   }
 
   console.log(`Found ${files.length} product files to process in ${locale} locale`);
+  const collectionsMap = buildCollectionsMap(locale);
   
   let successCount = 0;
   let errorCount = 0;
@@ -140,7 +271,7 @@ async function processAllProducts(locale = 'en') {
       const fileContent = fs.readFileSync(filePath, 'utf8');
       const product = JSON.parse(fileContent);
       
-      const transformedData = transformProductData(product, locale);
+      const transformedData = transformProductData(product, locale, collectionsMap);
       const success = await insertProduct(transformedData);
       
       if (success) {
@@ -168,8 +299,17 @@ async function insertSpecificProduct(filePath) {
   try {
     const fileContent = fs.readFileSync(filePath, 'utf8');
     const product = JSON.parse(fileContent);
-    
-    const transformedData = transformProductData(product);
+    const localeFromPath = (() => {
+      try {
+        const parts = filePath.split(path.sep);
+        const idx = parts.lastIndexOf('products');
+        if (idx !== -1 && idx + 1 < parts.length) return parts[idx + 1];
+      } catch (_) {}
+      return product.language || 'en';
+    })();
+
+    const collectionsMap = buildCollectionsMap(localeFromPath);
+    const transformedData = transformProductData(product, localeFromPath, collectionsMap);
     const success = await insertProduct(transformedData);
     
     if (success) {
