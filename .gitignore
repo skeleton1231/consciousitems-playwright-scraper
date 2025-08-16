@@ -6,7 +6,7 @@ yarn-error.log*
 
 # 输出文件
 output/
-*.json
+data/
 
 # 环境变量
 .env

@@ -1,0 +1,34 @@
+{
+  "name": "consciousitems-playwright-scraper",
+  "version": "1.0.0",
+  "description": "Playwright scraper for consciousitems.com sitemap data",
+  "main": "scrape-products.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "scrape-collections": "node scrape-collections.js",
+    "scrape-products": "node scrape-products.js",
+    "insert-to-supabase": "node insert-to-supabase.js",
+    "install-browsers": "npx playwright install chromium"
+  },
+  "keywords": [
+    "playwright",
+    "scraper",
+    "sitemap",
+    "ecommerce"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.53.0",
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12",
+    "dotenv": "^17.2.1",
+    "playwright": "^1.40.0",
+    "xml2js": "^0.6.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  }
+}
