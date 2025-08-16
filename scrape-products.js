@@ -47,6 +47,8 @@ class ProductScraper {
     this.ROTATE_PAGE_EVERY = parseInt(process.env.ROTATE_PAGE_EVERY || '20', 10);
     this.DELAY_MIN_MS = parseInt(process.env.DELAY_MIN_MS || '200', 10);
     this.DELAY_MAX_MS = parseInt(process.env.DELAY_MAX_MS || '300', 10);
+    this.processedCount = 0;
+    this.RECREATE_CONTEXT_EVERY = parseInt(process.env.RECREATE_CONTEXT_EVERY || '60', 10);
 
     // Supabase
     this.supabaseUrl = process.env.SUPABASE_URL;
@@ -157,8 +159,14 @@ class ProductScraper {
         '--js-flags=--max-old-space-size=256'
       ]
     });
+    await this._createContext();
+    logMemory('after:initBrowser');
+  }
+
+  async _createContext() {
     this.context = await this.browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+      viewport: { width: 800, height: 600 }
     });
     await this.context.route('**/*', (route) => {
       const type = route.request().resourceType();
@@ -169,7 +177,6 @@ class ProductScraper {
     });
     this.context.setDefaultNavigationTimeout(60000);
     this.context.setDefaultTimeout(25000);
-    logMemory('after:initBrowser');
   }
 
   // 关闭浏览器
@@ -263,6 +270,8 @@ class ProductScraper {
           console.log(`找到 ${allUrls.length} 个URL，其中 ${products.length} 个是产品URL`);
           const slice = products.slice(0, this.MAX_PRODUCTS);
           
+          let consecutiveFailures = 0;
+          const recreateAfter = parseInt(process.env.RECREATE_CONTEXT_AFTER_FAILS || '8', 10);
           for (let i = 0; i < slice.length; i++) {
             const product = slice[i];
             const productUrl = product.loc[0];
@@ -276,8 +285,12 @@ class ProductScraper {
               
               // 每个产品使用独立 Page，抓完即关，避免缓存/历史占用
               const page = await this.context.newPage();
-              const productData = await this.scrapeProductDetails(page, productUrl, language, images);
-              await page.close();
+              let productData = null;
+              try {
+                productData = await this.scrapeProductDetails(page, productUrl, language, images);
+              } finally {
+                await page.close();
+              }
               
               if (productData) {
                 // 直接入库（批量）
@@ -285,10 +298,12 @@ class ProductScraper {
                   const row = this.transformForDb(productData, language);
                   this.batchBuffer.push(row);
                   this.data.totalProducts++;
+                  this.processedCount++;
                   if (this.batchBuffer.length >= this.BATCH_SIZE) {
                     await this.flushBatch();
                   }
                   console.log(`✅ 待写入: ${productData.title}`);
+                  consecutiveFailures = 0;
                 } catch (error) {
                   console.error(`❌ 入库准备失败: ${productData.title}`, error.message);
                 }
@@ -298,12 +313,28 @@ class ProductScraper {
                 const randomDelay = Math.floor(Math.random() * range) + this.DELAY_MIN_MS;
                 console.log(`等待 ${randomDelay}ms 后继续下一个产品...`);
                 await Utils.delay(randomDelay);
+
+                // 周期性重建上下文，释放浏览器层面的内存
+                if (this.processedCount % this.RECREATE_CONTEXT_EVERY === 0) {
+                  console.warn(`已处理 ${this.processedCount} 个产品，周期性重建 Playwright 上下文以释放内存...`);
+                  try { await this.context.close(); } catch (_) {}
+                  await this._createContext();
+                  logMemory('after:periodicRecreateContext');
+                }
               }
               
             } catch (error) {
               console.error(`❌ 抓取产品失败 ${productUrl}:`, error.message);
               // 记录失败的URL到日志
               console.error(`失败的产品URL: ${productUrl}`);
+              consecutiveFailures++;
+              if (consecutiveFailures >= recreateAfter) {
+                console.warn(`连续失败 ${consecutiveFailures} 次，重建 Playwright 上下文以自愈...`);
+                try { await this.context.close(); } catch (_) {}
+                await this._createContext();
+                logMemory('after:recreateContext');
+                consecutiveFailures = 0;
+              }
             }
           }
         }
@@ -319,7 +350,7 @@ class ProductScraper {
     }
     
     await this.flushBatch();
-    await page.close();
+    // 确保不误关未定义的 page 变量
   }
 
   // 从sitemap中提取图片信息
