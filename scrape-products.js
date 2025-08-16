@@ -1,8 +1,10 @@
+require('dotenv').config();
 const { chromium } = require('playwright');
 const xml2js = require('xml2js');
 const axios = require('axios');
 const fs = require('fs').promises;
 const path = require('path');
+const { createClient } = require('@supabase/supabase-js');
 const config = require('./config');
 const Utils = require('./utils');
 
@@ -16,17 +18,134 @@ class ProductScraper {
     this.browser = null;
     this.context = null;
     this.locale = locale; // 新增locale参数
+    // 批量入库缓冲
+    this.batchBuffer = [];
+    this.BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '10', 10);
+    this.MAX_PRODUCTS = parseInt(process.env.MAX_PRODUCTS || '250', 10);
+    this.ROTATE_PAGE_EVERY = parseInt(process.env.ROTATE_PAGE_EVERY || '20', 10);
+    this.DELAY_MIN_MS = parseInt(process.env.DELAY_MIN_MS || '200', 10);
+    this.DELAY_MAX_MS = parseInt(process.env.DELAY_MAX_MS || '300', 10);
+
+    // Supabase
+    this.supabaseUrl = process.env.SUPABASE_URL;
+    this.supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    this.supabase = (this.supabaseUrl && this.supabaseKey)
+      ? createClient(this.supabaseUrl, this.supabaseKey)
+      : null;
+  }
+
+  // 将抓取的产品数据转换为数据库结构（价格单位：分）
+  transformForDb(product, locale = 'en') {
+    const priceCents = (() => {
+      if (Array.isArray(product.variants) && product.variants.length > 0) {
+        const preferred = product.variants.find(v => v && v.available) || product.variants[0];
+        if (!preferred) return 0;
+        if (typeof preferred.price === 'number' && Number.isFinite(preferred.price)) return Math.round(preferred.price);
+        if (typeof preferred.price === 'string') return this.extractPrice(preferred.price);
+      }
+      return this.extractPrice(product.price);
+    })();
+
+    let availability = false;
+    if (Array.isArray(product.variants) && product.variants.length > 0) {
+      availability = product.variants.some(v => Boolean(v && v.available));
+    } else if (typeof product.availability === 'boolean') {
+      availability = product.availability;
+    } else if (typeof product.availability === 'string') {
+      const t = product.availability.toLowerCase();
+      availability = !(t.includes('out of stock') || t.includes('unavailable') || t.includes('sold out') || t === 'false');
+    }
+
+    return {
+      slug: product.id,
+      name: product.title,
+      description: this.cleanHtml(product.description),
+      category: 'Jewelry',
+      price: priceCents,
+      currency: 'USD',
+      image_url: (product.images && product.images[0] && product.images[0].url) ? (product.images[0].url.startsWith('//') ? `https:${product.images[0].url}` : product.images[0].url) : null,
+      affiliate_url: product.url,
+      locale: locale,
+      features: product.features,
+      dimensions: product.dimensions,
+      rating: product.rating ? parseFloat(product.rating) : null,
+      review_count: product.reviewCount || null,
+      availability: availability,
+      clean_description: this.cleanHtml(product.description),
+      clean_features: product.features ? this.cleanHtml(product.features) : null
+    };
+  }
+
+  extractPrice(priceString) {
+    if (!priceString) return 0;
+    const cleanPrice = priceString.replace(/[$,]/g, '');
+    const price = parseFloat(cleanPrice);
+    return Math.round(price * 100);
+  }
+
+  cleanHtml(text) {
+    if (!text) return '';
+    return text
+      .replace(/<[^>]*>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  async flushBatch() {
+    if (!this.supabase || this.batchBuffer.length === 0) return;
+    const rows = this.batchBuffer.splice(0, this.batchBuffer.length);
+    try {
+      const { error } = await this.supabase
+        .from('all_products')
+        .upsert(rows, { onConflict: 'slug' });
+      if (error) console.error('批量写入失败:', error);
+      else console.log(`✅ 批量写入 ${rows.length} 条`);
+    } catch (e) {
+      console.error('批量写入异常:', e);
+    }
   }
 
   // 初始化浏览器
   async initBrowser() {
     this.browser = await chromium.launch({
-      ...config.browser,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
+        '--disable-background-networking',
+        '--disable-background-timer-throttling',
+        '--disable-breakpad',
+        '--disable-default-apps',
+        '--disable-extensions',
+        '--disable-hang-monitor',
+        '--disable-popup-blocking',
+        '--metrics-recording-only',
+        '--mute-audio',
+        '--blink-settings=imagesEnabled=false',
+        '--js-flags=--max-old-space-size=256'
+      ]
     });
     this.context = await this.browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     });
+    await this.context.route('**/*', (route) => {
+      const type = route.request().resourceType();
+      const url = route.request().url();
+      if (['image','media','font'].includes(type)) return route.abort();
+      if (/googletagmanager|google-analytics|gtag|doubleclick|facebook|hotjar|segment|optimizely|clarity/.test(url)) return route.abort();
+      route.continue();
+    });
+    this.context.setDefaultNavigationTimeout(60000);
+    this.context.setDefaultTimeout(25000);
   }
 
   // 关闭浏览器
@@ -90,7 +209,7 @@ class ProductScraper {
   // 抓取产品数据
   async scrapeProducts(productSitemaps) {
     console.log('开始抓取产品数据...');
-    const page = await this.context.newPage();
+    let page = await this.context.newPage();
 
     for (const sitemap of productSitemaps) {
       const url = sitemap.loc[0];
@@ -119,9 +238,10 @@ class ProductScraper {
           });
           
           console.log(`找到 ${allUrls.length} 个URL，其中 ${products.length} 个是产品URL`);
+          const slice = products.slice(0, this.MAX_PRODUCTS);
           
-          for (let i = 0; i < products.length; i++) {
-            const product = products[i];
+          for (let i = 0; i < slice.length; i++) {
+            const product = slice[i];
             const productUrl = product.loc[0];
             const lastmod = product.lastmod ? product.lastmod[0] : null;
             
@@ -135,18 +255,22 @@ class ProductScraper {
               const productData = await this.scrapeProductDetails(page, productUrl, language, images);
               
               if (productData) {
-                // 立即保存单个产品
+                // 直接入库（批量）
                 try {
-                  await this.saveProductData(productData);
-                  this.data.products.push(productData);
+                  const row = this.transformForDb(productData, language);
+                  this.batchBuffer.push(row);
                   this.data.totalProducts++;
-                  console.log(`✅ 产品已保存: ${productData.title}`);
+                  if (this.batchBuffer.length >= this.BATCH_SIZE) {
+                    await this.flushBatch();
+                  }
+                  console.log(`✅ 待写入: ${productData.title}`);
                 } catch (error) {
-                  console.error(`❌ 保存产品失败: ${productData.title}`, error.message);
+                  console.error(`❌ 入库准备失败: ${productData.title}`, error.message);
                 }
                 
-                // 添加随机延迟避免被检测 (200-300ms)
-                const randomDelay = Math.floor(Math.random() * 100) + 200; // 200-300ms
+                // 添加随机延迟避免被检测
+                const range = Math.max(0, this.DELAY_MAX_MS - this.DELAY_MIN_MS + 1);
+                const randomDelay = Math.floor(Math.random() * range) + this.DELAY_MIN_MS;
                 console.log(`等待 ${randomDelay}ms 后继续下一个产品...`);
                 await Utils.delay(randomDelay);
               }
@@ -155,6 +279,11 @@ class ProductScraper {
               console.error(`❌ 抓取产品失败 ${productUrl}:`, error.message);
               // 记录失败的URL到日志
               console.error(`失败的产品URL: ${productUrl}`);
+            }
+
+            if ((i + 1) % this.ROTATE_PAGE_EVERY === 0) {
+              try { await page.close(); } catch (_) {}
+              page = await this.context.newPage();
             }
           }
         }
@@ -169,6 +298,7 @@ class ProductScraper {
       }
     }
     
+    await this.flushBatch();
     await page.close();
   }
 
@@ -1155,71 +1285,20 @@ class ProductScraper {
 
   // 保存单个产品数据
   async saveProductData(productData) {
-    try {
-      // 清理和验证数据
-      const sanitizedData = this.sanitizeProductData(productData);
-      
-      // 生成slug
-      const slug = this.generateSlug(productData.url);
-      const locale = productData.language || 'en';
-      
-      // 创建目录结构
-      const productDir = path.join('data', 'products', locale);
-      await fs.mkdir(productDir, { recursive: true });
-      
-      // 保存文件
-      const filepath = path.join(productDir, `${slug}.json`);
-      await fs.writeFile(filepath, JSON.stringify(sanitizedData, null, 2), 'utf8');
-      
-      console.log(`产品数据已保存: ${filepath}`);
-      return filepath;
-    } catch (error) {
-      console.error('保存产品数据失败:', error);
-      throw error;
-    }
+    // 已弃用：不再落盘保存
+    return null;
   }
 
   // 保存数据（现在主要用于生成统计文件）
   async saveData() {
-    try {
-      console.log('\n生成统计信息...');
-      
-      // 生成统计文件
-      await this.saveStats();
-      
-      console.log(`\n抓取完成: 总共 ${this.data.totalProducts} 个产品`);
-      
-    } catch (error) {
-      console.error('保存数据失败:', error);
-      throw error;
-    }
+    // 已弃用：不再生成统计文件
+    return;
   }
 
   // 保存统计信息
   async saveStats() {
-    try {
-      const stats = this.generateStats();
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      
-      // 确保统计目录存在
-      const statsDir = path.join('data', 'stats');
-      await fs.mkdir(statsDir, { recursive: true });
-      
-      const statsData = {
-        scrapedAt: new Date().toISOString(),
-        totalProducts: this.data.totalProducts,
-        languages: this.data.languages,
-        stats: stats
-      };
-      
-      const statsFile = path.join(statsDir, `products_stats_${timestamp}.json`);
-      await fs.writeFile(statsFile, JSON.stringify(statsData, null, 2), 'utf8');
-      
-      console.log(`统计信息已保存: ${statsFile}`);
-      
-    } catch (error) {
-      console.error('保存统计信息失败:', error);
-    }
+    // 已弃用：不再生成统计文件
+    return;
   }
 
   // 主运行方法
@@ -1251,12 +1330,7 @@ class ProductScraper {
       // 抓取产品数据
       await this.scrapeProducts(productSitemaps);
       
-      // 生成统计信息
-      const stats = this.generateStats();
-      this.printStats(stats);
-      
-      // 保存数据
-      await this.saveData();
+      // 直接结束（不生成统计、不落盘）
       
       console.log('\n产品抓取任务完成!');
       
