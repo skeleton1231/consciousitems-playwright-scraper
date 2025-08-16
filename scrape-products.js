@@ -145,8 +145,8 @@ class ProductScraper {
                   console.error(`❌ 保存产品失败: ${productData.title}`, error.message);
                 }
                 
-                // 添加随机延迟避免被检测 (2-5秒)
-                const randomDelay = Math.floor(Math.random() * 3000) + 2000; // 2000-5000ms
+                // 添加随机延迟避免被检测 (200-300ms)
+                const randomDelay = Math.floor(Math.random() * 100) + 200; // 200-300ms
                 console.log(`等待 ${randomDelay}ms 后继续下一个产品...`);
                 await Utils.delay(randomDelay);
               }

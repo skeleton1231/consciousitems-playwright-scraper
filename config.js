@@ -6,16 +6,27 @@ module.exports = {
   // 浏览器配置
   browser: {
     headless: true,
-    slowMo: 200, // 延迟，避免被检测 - 增加到200ms
-    timeout: 30000
+    slowMo: 50, // 减少延迟到50ms，避免被检测但提高速度
+    timeout: 20000 // 减少超时时间到20秒
   },
   
   // 抓取配置
   scraping: {
-    maxConcurrent: 3, // 最大并发数
-    delayBetweenRequests: 3000, // 请求间隔(毫秒) - 增加到3秒
-    maxRetries: 3, // 最大重试次数
-    timeout: 30000 // 页面加载超时
+    maxConcurrent: 5, // 增加并发数到5
+    delayBetweenRequests: 1000, // 减少请求间隔到1秒
+    maxRetries: 2, // 减少重试次数到2次
+    timeout: 20000, // 减少页面加载超时到20秒
+    // 新增：产品间延迟配置
+    productDelay: {
+      min: 500, // 最小延迟500ms
+      max: 1500  // 最大延迟1.5秒
+    },
+    // 新增：页面等待配置
+    pageWait: {
+      selectorTimeout: 15000, // 选择器等待超时15秒
+      pageLoadDelay: 1000, // 页面加载后额外等待1秒
+      waitUntil: 'domcontentloaded' // 等待策略
+    }
   },
   
   // 语言配置
