@@ -6,7 +6,6 @@ const { createClient } = require('@supabase/supabase-js');
 const os = require('os');
 const config = require('./config');
 const Utils = require('./utils');
-const LegacyProductScraper = require('./scrape-products');
 
 // Environment / runtime knobs
 const MAX_PRODUCTS = parseInt(process.env.MAX_PRODUCTS || '250', 10);
@@ -74,30 +73,11 @@ function getFirstImageUrl(images) {
 }
 
 function transformProductData(product, locale = 'en') {
+  const price = extractPrice(product.price);
   const slug = product.id;
 
-  // Prefer variant numeric price in cents when available; fallback to parsed display price
-  let priceCents = 0;
-  if (Array.isArray(product.variants) && product.variants.length > 0) {
-    const preferred = product.variants.find((v) => v && v.available) || product.variants[0];
-    if (preferred) {
-      if (typeof preferred.price === 'number' && Number.isFinite(preferred.price)) {
-        // Shopify variant price is already in cents
-        priceCents = Math.round(preferred.price);
-      } else if (typeof preferred.price === 'string') {
-        priceCents = extractPrice(preferred.price);
-      }
-    }
-  }
-  if (!priceCents) {
-    priceCents = extractPrice(product.price);
-  }
-
-  // Determine availability: if variants exist, any available => true; else use product.availability
   let availability = false;
-  if (Array.isArray(product.variants) && product.variants.length > 0) {
-    availability = product.variants.some((v) => Boolean(v && v.available));
-  } else if (product.availability !== null && product.availability !== undefined) {
+  if (product.availability !== null && product.availability !== undefined) {
     if (typeof product.availability === 'boolean') {
       availability = product.availability;
     } else if (typeof product.availability === 'string') {
@@ -111,7 +91,7 @@ function transformProductData(product, locale = 'en') {
     name: product.title,
     description: cleanHtml(product.description),
     category: 'Jewelry',
-    price: priceCents,
+    price: price,
     currency: 'USD',
     image_url: getFirstImageUrl(product.images),
     affiliate_url: product.url,
@@ -152,7 +132,6 @@ class ProductScraper {
     this.batchBuffer = [];
     this.totalProcessed = 0;
     this.languages = new Set();
-    this.legacy = new LegacyProductScraper(locale);
   }
 
   async initBrowser() {
@@ -255,26 +234,83 @@ class ProductScraper {
   }
 
   async scrapeProductDetails(page, productUrl, language, sitemapImages) {
-    // Delegate extraction to legacy scraper's battle-tested method, with retries
-    const maxAttempts = Math.max(1, Math.min(5, MAX_RETRIES_PER_PRODUCT));
-    let lastError = null;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        const data = await this.legacy.scrapeProductDetails(page, productUrl, language, sitemapImages);
-        if (data) return data;
-        throw new Error('Empty product data');
-      } catch (e) {
-        lastError = e;
-        if (attempt === maxAttempts) {
-          console.error(`❌ 抓取产品详情失败(${attempt}/${maxAttempts}): ${e.message}`);
-          console.error(`失败的URL: ${productUrl}`);
-          return null;
+    try {
+      // Retry navigation a few times to dodge transient network changes
+      const maxAttempts = Math.max(1, Math.min(5, MAX_RETRIES_PER_PRODUCT));
+      let lastError = null;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          await page.goto(productUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+          break; // success
+        } catch (e) {
+          lastError = e;
+          if (attempt === maxAttempts) throw e;
+          const backoff = 400 * attempt + Math.floor(Math.random() * 200);
+          await page.waitForTimeout(backoff);
         }
-        const backoff = 400 * attempt + Math.floor(Math.random() * 200);
-        try { await page.waitForTimeout(backoff); } catch (_) {}
       }
+      await page.waitForSelector('h1, .product__title, .product-title', { timeout: 30000 });
+      await page.waitForTimeout(1000);
+
+      const productData = {
+        id: this.generateSlug(productUrl),
+        url: productUrl,
+        language: language,
+        lastmod: null,
+        title: '',
+        price: '',
+        originalPrice: '',
+        description: '',
+        features: '',
+        dimensions: '',
+        materials: '',
+        images: [],
+        variants: [],
+        sku: '',
+        category: '',
+        rating: null,
+        reviewCount: 0,
+        availability: null,
+        scrapedAt: new Date().toISOString()
+      };
+
+      productData.title = await this.extractTitle(page);
+      const priceInfo = await this.extractPriceInfo(page);
+      productData.price = priceInfo.price;
+      productData.originalPrice = priceInfo.originalPrice;
+      productData.features = await this.extractFeatures(page);
+      productData.description = await this.extractDescription(page);
+      const specs = await this.extractSpecifications(page);
+      productData.dimensions = specs.dimensions;
+      productData.materials = specs.materials;
+      productData.variants = await this.extractVariants(page);
+
+      if (productData.variants && productData.variants.length > 0) {
+        const firstAvailableVariant = productData.variants.find((v) => v.available);
+        const selected = firstAvailableVariant || productData.variants[0];
+        if (selected && typeof selected.price === 'number') {
+          const variantPrice = selected.price / 100;
+          productData.price = `$${variantPrice.toFixed(2)}`;
+        }
+      }
+
+      productData.images = await this.extractImages(page, sitemapImages);
+      productData.sku = await this.extractSku(page);
+      productData.category = await this.extractCategory(page);
+      const ratingInfo = await this.extractRatingInfo(page);
+      productData.rating = ratingInfo.rating;
+      productData.reviewCount = ratingInfo.reviewCount;
+      if (productData.variants && productData.variants.length > 0) {
+        productData.availability = productData.variants.some((v) => v.available);
+      } else {
+        productData.availability = await this.extractAvailability(page);
+      }
+      return productData;
+    } catch (error) {
+      console.error(`❌ 抓取产品详情失败: ${error.message}`);
+      console.error(`失败的URL: ${productUrl}`);
+      return null;
     }
-    return null;
   }
 
   async extractTitle(page) {
@@ -778,5 +814,4 @@ if (require.main === module) {
 }
 
 module.exports = { ProductScraper };
-
 

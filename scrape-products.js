@@ -2,11 +2,33 @@ require('dotenv').config();
 const { chromium } = require('playwright');
 const xml2js = require('xml2js');
 const axios = require('axios');
+const os = require('os');
 const fs = require('fs').promises;
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 const config = require('./config');
 const Utils = require('./utils');
+
+// Memory logging helpers
+function formatMB(bytes) {
+  if (!Number.isFinite(bytes)) return '0.0';
+  return (bytes / 1024 / 1024).toFixed(1);
+}
+
+function logMemory(tag) {
+  try {
+    const mu = process.memoryUsage();
+    const rss = formatMB(mu.rss);
+    const heapUsed = formatMB(mu.heapUsed);
+    const heapTotal = formatMB(mu.heapTotal);
+    const external = formatMB(mu.external);
+    const arrayBuffers = formatMB(mu.arrayBuffers || 0);
+    const freeSys = formatMB(os.freemem());
+    const totalSys = formatMB(os.totalmem());
+    const time = new Date().toISOString();
+    console.log(`[MEM ${time}] ${tag} rss=${rss}MB heapUsed=${heapUsed}MB heapTotal=${heapTotal}MB external=${external}MB arrayBuffers=${arrayBuffers}MB sysFree=${freeSys}MB sysTotal=${totalSys}MB`);
+  } catch (_) {}
+}
 
 class ProductScraper {
   constructor(locale = null) {
@@ -106,6 +128,7 @@ class ProductScraper {
         .upsert(rows, { onConflict: 'slug' });
       if (error) console.error('批量写入失败:', error);
       else console.log(`✅ 批量写入 ${rows.length} 条`);
+      logMemory(`after:upsert:batch:${rows.length}`);
     } catch (e) {
       console.error('批量写入异常:', e);
     }
@@ -146,6 +169,7 @@ class ProductScraper {
     });
     this.context.setDefaultNavigationTimeout(60000);
     this.context.setDefaultTimeout(25000);
+    logMemory('after:initBrowser');
   }
 
   // 关闭浏览器
@@ -209,7 +233,6 @@ class ProductScraper {
   // 抓取产品数据
   async scrapeProducts(productSitemaps) {
     console.log('开始抓取产品数据...');
-    let page = await this.context.newPage();
 
     for (const sitemap of productSitemaps) {
       const url = sitemap.loc[0];
@@ -251,8 +274,10 @@ class ProductScraper {
               // 提取产品图片信息
               const images = this.extractImagesFromSitemap(product);
               
-              // 抓取产品详情
+              // 每个产品使用独立 Page，抓完即关，避免缓存/历史占用
+              const page = await this.context.newPage();
               const productData = await this.scrapeProductDetails(page, productUrl, language, images);
+              await page.close();
               
               if (productData) {
                 // 直接入库（批量）
@@ -279,11 +304,6 @@ class ProductScraper {
               console.error(`❌ 抓取产品失败 ${productUrl}:`, error.message);
               // 记录失败的URL到日志
               console.error(`失败的产品URL: ${productUrl}`);
-            }
-
-            if ((i + 1) % this.ROTATE_PAGE_EVERY === 0) {
-              try { await page.close(); } catch (_) {}
-              page = await this.context.newPage();
             }
           }
         }
@@ -1305,6 +1325,7 @@ class ProductScraper {
   async run() {
     const localeInfo = this.locale ? ` (语言: ${this.locale})` : ' (所有支持的语言)';
     console.log(`开始产品抓取任务${localeInfo}...`);
+    logMemory('start');
     
     try {
       // 初始化浏览器
@@ -1340,6 +1361,7 @@ class ProductScraper {
     } finally {
       // 关闭浏览器
       await this.closeBrowser();
+      logMemory('end');
     }
   }
 }
