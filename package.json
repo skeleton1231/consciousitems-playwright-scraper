@@ -10,6 +10,7 @@
     "scrape-collections": "node scrape-collections.js",
     "scrape-products": "node scrape-products.js",
     "insert-to-supabase": "node insert-to-supabase.js",
+    "scrape-insert": "node scrape-insert.js",
     "install-browsers": "npx playwright install chromium"
   },
   "keywords": [
